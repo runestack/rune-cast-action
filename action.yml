@@ -1,0 +1,198 @@
+name: 'Rune Cast'
+description: 'Deploy services to a Rune cluster. Faithful 1:1 wrapper around `rune cast`.'
+author: 'Runestack'
+branding:
+  icon: 'send'
+  color: 'purple'
+
+# ── Design principle ──────────────────────────────────────────────────────
+# Every input below maps 1:1 to a `rune cast` flag (or to a `rune login`
+# auth flag). No subset, no opinionated shortcuts. If the CLI doesn't
+# accept it, this action doesn't either; if the CLI grows a flag, this
+# action grows the matching input. Source of truth: `rune cast --help`.
+
+inputs:
+  # ── Auth (rune login) ──────────────────────────────────────────────────
+  server:
+    description: 'Rune gRPC server address (host:port). Maps to: rune login --server.'
+    required: true
+  token:
+    description: |
+      Bearer token used to authenticate. Piped over stdin so it never
+      appears on argv. Mask it as a secret.
+    required: true
+
+  # ── Source (positional arg to `rune cast <source>`) ────────────────────
+  source:
+    description: |
+      What to cast. Path to a runefile / cast file, a directory, a glob,
+      or a URL to a remote runeset archive. Maps to the positional
+      argument of `rune cast`.
+    required: true
+
+  # ── 1:1 with `rune cast` flags (all optional) ──────────────────────────
+  namespace:
+    description: 'Namespace to deploy into (-n / --namespace).'
+    required: false
+    default: ''
+  values:
+    description: |
+      Values file(s) to merge. Multi-line strings are split on newline
+      and passed as repeated -f flags. Maps to: rune cast -f / --values.
+    required: false
+    default: ''
+  set:
+    description: |
+      Set values on the command line as key=value. Multi-line strings
+      are split and passed as repeated --set flags. Maps to: rune cast --set.
+    required: false
+    default: ''
+  tag:
+    description: 'Tag for this deployment (e.g. stable, canary). Maps to: rune cast --tag.'
+    required: false
+    default: ''
+  release:
+    description: 'Override the release name from the runeset manifest. Maps to: rune cast --release.'
+    required: false
+    default: ''
+  recursive:
+    description: 'Recurse into directories when source is a directory. Maps to: rune cast -r / --recursive.'
+    required: false
+    default: 'false'
+  create-namespace:
+    description: 'Create the namespace if it does not exist. Maps to: rune cast --create-namespace.'
+    required: false
+    default: 'false'
+  force:
+    description: 'Force generation increment even if no changes are detected. Maps to: rune cast --force.'
+    required: false
+    default: 'false'
+  dry-run:
+    description: 'Validate the cast without applying it. Maps to: rune cast --dry-run.'
+    required: false
+    default: 'false'
+  render:
+    description: 'Render and print rendered manifests, do not apply. Maps to: rune cast --render.'
+    required: false
+    default: 'false'
+  detach:
+    description: 'Return immediately without waiting for the deployment. Maps to: rune cast --detach.'
+    required: false
+    default: 'false'
+  timeout:
+    description: 'Timeout for the wait operation (e.g. 5m). Maps to: rune cast --timeout.'
+    required: false
+    default: '5m'
+
+  # ── Action-only ────────────────────────────────────────────────────────
+  version:
+    description: 'Rune CLI version to install (or "latest"). Maps to: runestack/rune-setup version.'
+    required: false
+    default: 'latest'
+  github-token:
+    description: 'GitHub token for the CLI download (defaults to workflow token).'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  version:
+    description: 'The resolved Rune CLI version that was installed.'
+    value: ${{ steps.setup.outputs.version }}
+
+runs:
+  using: 'composite'
+  steps:
+    # ── 1. Install the CLI (delegates to rune-setup-action so the install
+    #       logic only lives in one place).
+    - id: setup
+      uses: runestack/rune-setup-action@v1
+      with:
+        version: ${{ inputs.version }}
+        github-token: ${{ inputs.github-token }}
+
+    # ── 2. Mask the token, login, cast.
+    #       Token is piped over stdin (rune login --token-stdin) so it
+    #       never appears on argv where /proc, ps, or naive log capture
+    #       could see it. ::add-mask:: belt-and-braces in case any
+    #       upstream step echoes it.
+    - id: cast
+      shell: bash
+      env:
+        RUNE_SERVER:           ${{ inputs.server }}
+        RUNE_TOKEN:            ${{ inputs.token }}
+        INPUT_SOURCE:          ${{ inputs.source }}
+        INPUT_NAMESPACE:       ${{ inputs.namespace }}
+        INPUT_VALUES:          ${{ inputs.values }}
+        INPUT_SET:             ${{ inputs.set }}
+        INPUT_TAG:             ${{ inputs.tag }}
+        INPUT_RELEASE:         ${{ inputs.release }}
+        INPUT_RECURSIVE:       ${{ inputs.recursive }}
+        INPUT_CREATE_NS:       ${{ inputs.create-namespace }}
+        INPUT_FORCE:           ${{ inputs.force }}
+        INPUT_DRY_RUN:         ${{ inputs.dry-run }}
+        INPUT_RENDER:          ${{ inputs.render }}
+        INPUT_DETACH:          ${{ inputs.detach }}
+        INPUT_TIMEOUT:         ${{ inputs.timeout }}
+      run: |
+        set -euo pipefail
+        echo "::add-mask::${RUNE_TOKEN}"
+
+        if [ -z "${RUNE_TOKEN:-}" ]; then
+          echo "::error::'token' input is required and was empty."
+          exit 1
+        fi
+        if [ -z "${INPUT_SOURCE:-}" ]; then
+          echo "::error::'source' input is required and was empty."
+          exit 1
+        fi
+
+        # ── Login. Use a workflow-local context name so we don't collide
+        #     with anything pre-existing on the runner. --token-stdin
+        #     keeps the secret off argv.
+        printf '%s' "$RUNE_TOKEN" | rune login rune-cast-action \
+          --server "$RUNE_SERVER" \
+          --token-stdin
+
+        # ── Build `rune cast` argv from the inputs. Multi-line inputs
+        #     (values, set) become repeated flags, one per non-blank line.
+        args=("$INPUT_SOURCE")
+
+        push_repeated() {
+          local flag="$1" raw="$2"
+          [ -z "$raw" ] && return 0
+          while IFS= read -r line; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            [ -z "$line" ] && continue
+            args+=("$flag" "$line")
+          done <<< "$raw"
+        }
+
+        push_string() {
+          local flag="$1" raw="$2"
+          [ -z "$raw" ] && return 0
+          args+=("$flag" "$raw")
+        }
+
+        push_bool() {
+          local flag="$1" raw="$2"
+          case "${raw,,}" in
+            1|true|yes) args+=("$flag") ;;
+          esac
+        }
+
+        push_string  --namespace        "$INPUT_NAMESPACE"
+        push_repeated -f                "$INPUT_VALUES"
+        push_repeated --set             "$INPUT_SET"
+        push_string  --tag              "$INPUT_TAG"
+        push_string  --release          "$INPUT_RELEASE"
+        push_bool    --recursive        "$INPUT_RECURSIVE"
+        push_bool    --create-namespace "$INPUT_CREATE_NS"
+        push_bool    --force            "$INPUT_FORCE"
+        push_bool    --dry-run          "$INPUT_DRY_RUN"
+        push_bool    --render           "$INPUT_RENDER"
+        push_bool    --detach           "$INPUT_DETACH"
+        push_string  --timeout          "$INPUT_TIMEOUT"
+
+        echo "Running: rune cast ${args[*]}"
+        rune cast "${args[@]}"
