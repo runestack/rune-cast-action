@@ -25,9 +25,9 @@ inputs:
   # ── Source (positional arg to `rune cast <source>`) ────────────────────
   source:
     description: |
-      What to cast. Path to a runefile / cast file, a directory, a glob,
-      or a URL to a remote runeset archive. Maps to the positional
-      argument of `rune cast`.
+      What to cast: a cast file, a directory, a .runeset.tgz archive (local
+      path or https:// URL), or a github.com/org/repo path. Maps to the
+      positional argument of `rune cast`.
     required: true
 
   # ── 1:1 with `rune cast` flags (all optional) ──────────────────────────
@@ -83,6 +83,32 @@ inputs:
     description: 'Timeout for the wait operation (e.g. 5m). Maps to: rune cast --timeout.'
     required: false
     default: '5m'
+  adopt:
+    description: 'Take over resources that are unmanaged or owned by another release. Maps to: rune cast --adopt.'
+    required: false
+    default: 'false'
+  atomic:
+    description: |
+      Roll this cast's changes back if it fails (a verify timeout also triggers
+      rollback). Maps to: rune cast --atomic.
+    required: false
+    default: 'false'
+  # Quoted so the YAML 1.1 `yes`/`no` boolean coercion can't turn the input id
+  # into `true`. The id is still "yes"; reference it as inputs.yes.
+  "yes":
+    description: |
+      Skip the interactive confirmation prompt for plans that prune or adopt
+      resources. REQUIRED in CI for any cast that prunes or adopts — without it
+      the CLI blocks waiting on a TTY that does not exist. Maps to: rune cast --yes.
+    required: false
+    default: 'false'
+  output:
+    description: |
+      Output format for a machine-readable plan + result. Only "json" is
+      supported. When set, the structured output is also exposed as this
+      action's `result` output. Maps to: rune cast -o / --output.
+    required: false
+    default: ''
 
   # ── Action-only ────────────────────────────────────────────────────────
   version:
@@ -98,6 +124,11 @@ outputs:
   version:
     description: 'The resolved Rune CLI version that was installed.'
     value: ${{ steps.setup.outputs.version }}
+  result:
+    description: |
+      The cast command's stdout. Most useful with output: json, where it is the
+      structured plan + result for a downstream step to parse.
+    value: ${{ steps.cast.outputs.result }}
 
 runs:
   using: 'composite'
@@ -133,6 +164,10 @@ runs:
         INPUT_RENDER:          ${{ inputs.render }}
         INPUT_DETACH:          ${{ inputs.detach }}
         INPUT_TIMEOUT:         ${{ inputs.timeout }}
+        INPUT_ADOPT:           ${{ inputs.adopt }}
+        INPUT_ATOMIC:          ${{ inputs.atomic }}
+        INPUT_YES:             ${{ inputs.yes }}
+        INPUT_OUTPUT:          ${{ inputs.output }}
       run: |
         set -euo pipefail
         echo "::add-mask::${RUNE_TOKEN}"
@@ -193,6 +228,29 @@ runs:
         push_bool    --render           "$INPUT_RENDER"
         push_bool    --detach           "$INPUT_DETACH"
         push_string  --timeout          "$INPUT_TIMEOUT"
+        push_bool    --adopt            "$INPUT_ADOPT"
+        push_bool    --atomic           "$INPUT_ATOMIC"
+        push_bool    --yes              "$INPUT_YES"
+        push_string  --output           "$INPUT_OUTPUT"
 
         echo "Running: rune cast ${args[*]}"
-        rune cast "${args[@]}"
+
+        # Capture stdout to a file while still streaming it to the log, so the
+        # rendered plan / json result can be surfaced as the `result` output.
+        # Capture rune's own exit code (not tee's) and expose `result` even on
+        # failure — a -o json error payload is exactly what a consumer wants to
+        # inspect — then re-raise the failure so the step still fails.
+        out_file="$(mktemp)"
+        set +e
+        rune cast "${args[@]}" | tee "$out_file"
+        rc=${PIPESTATUS[0]}
+        set -e
+
+        {
+          echo "result<<__RUNE_CAST_EOF__"
+          cat "$out_file"
+          echo "__RUNE_CAST_EOF__"
+        } >> "$GITHUB_OUTPUT"
+        rm -f "$out_file"
+
+        exit "$rc"

@@ -23,6 +23,41 @@ not a root admin token. Mint one with:
 rune admin service create ci-stg --namespace stg --permissions cast
 ```
 
+### Deploy a named release
+
+Cast a runeset as a named [release](https://docs.runestack.io) (a persisted,
+diffable, roll-back-able record). Use `release` to pin the release name and
+`yes` so a prune/adopt plan doesn't block on a confirmation prompt that has no
+TTY in CI:
+
+```yaml
+- uses: runestack/rune-cast-action@v1
+  with:
+    server:  ${{ vars.RUNED_HOST }}
+    token:   ${{ secrets.RUNE_TOKEN }}
+    source:  https://example.com/runesets/api-1.4.2.runeset.tgz
+    release: api          # overrides the runeset manifest name
+    values:  infra/values/prod.yaml
+    namespace: prod
+    atomic:  true         # roll back if the deploy fails
+    yes:     true         # auto-confirm prune/adopt (no TTY in CI)
+```
+
+To gate a deploy on the computed plan, render JSON and read the `result` output:
+
+```yaml
+- id: plan
+  uses: runestack/rune-cast-action@v1
+  with:
+    server: ${{ vars.RUNED_HOST }}
+    token:  ${{ secrets.RUNE_TOKEN }}
+    source: ./runeset
+    release: api
+    dry-run: true
+    output:  json
+- run: echo '${{ steps.plan.outputs.result }}' | jq '.plan'
+```
+
 ## Design principle
 
 Every input maps **1:1** to a `rune cast` flag (or to a `rune login`
@@ -61,6 +96,10 @@ action grows the matching input. Source of truth: `rune cast --help`.
 | `render`           | `--render`                        | Print rendered manifests, do not apply.                     |
 | `detach`           | `--detach`                        | Return immediately without waiting.                         |
 | `timeout`          | `--timeout`                       | Default `5m`.                                               |
+| `adopt`            | `--adopt`                         | Take over resources that are unmanaged or owned by another release. |
+| `atomic`           | `--atomic`                        | Roll this cast's changes back on failure (verify timeout also triggers rollback). |
+| `yes`              | `--yes`                           | Skip the confirmation prompt for plans that **prune or adopt**. Required in CI for such plans — without it the CLI blocks on a TTY that does not exist. |
+| `output`           | `-o / --output`                   | `json` for a machine-readable plan + result. Also exposed as the `result` output. |
 
 Boolean inputs accept `true` / `false` (and `1` / `0` / `yes` / `no`).
 
@@ -76,6 +115,7 @@ Boolean inputs accept `true` / `false` (and `1` / `0` / `yes` / `no`).
 | Output    | Description                                       |
 |-----------|---------------------------------------------------|
 | `version` | The resolved Rune CLI version that was installed. |
+| `result`  | The cast command's stdout. Most useful with `output: json`, where it is the structured plan + result for a downstream step to parse. |
 
 ## Examples
 
