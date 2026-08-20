@@ -145,4 +145,4 @@ directly.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache-2.0 — see [LICENSE](LICENSE). Matches the licence of [Rune](https://github.com/runestack/rune) itself.
